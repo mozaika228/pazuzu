@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/loader"
+  "crates/loader",
+  "crates/ml_infer"
 ]
 
 [workspace.package]
