@@ -1,49 +1,49 @@
-# Pazuzu
+п»ї# Pazuzu
 
-Высокопроизводительный WAF / IPS / Rate Limiter / Bot Protection на базе eBPF/XDP + userspace control plane.
+High-performance WAF / IPS / Rate Limiter / Bot Protection built on eBPF/XDP with a userspace control plane.
 
-Сейчас в репозитории:
-- `ebpf/xdp_pass.bpf.c` — XDP программа: парсинг IPv4, blocklist, rate limiting, counters.
-- `crates/loader` — userspace loader + HTTP API (axum) для управления правилами и rate limit.
-- `crates/ml_infer` — каркас inference на Rust.
-- `ml/train` — каркас обучения в Python.
+## In This Repo
+- `ebpf/xdp_pass.bpf.c` вЂ” XDP program: IPv4 parsing, blocklist, rate limiting, counters.
+- `crates/loader` вЂ” userspace loader + HTTP API (axum) for rules and rate control.
+- `crates/ml_infer` вЂ” Rust inference stub.
+- `ml/train` вЂ” Python training skeleton.
 
-## Быстрый старт (Linux)
+## Quick Start (Linux)
 
-Зависимости:
+Dependencies:
 - `clang`, `llvm`, `bpftool`
 - `libbpf` (dev)
 - `rustup` (Rust 1.76+)
-- заголовки ядра
+- kernel headers
 
-Сборка и запуск:
+Build and run:
 ```bash
 cd pazuzu
 cargo build -p pazuzu-loader
 sudo ./target/debug/pazuzu-loader --iface eth0 --mode native --api 127.0.0.1:8080 --rate 1000 --burst 2000
 ```
 
-Остановка: `Ctrl+C`.
+Stop: `Ctrl+C`.
 
 ## API
 
-- `POST /block/{ip}` — добавить IP в blocklist
-- `DELETE /block/{ip}` — удалить IP из blocklist
-- `POST /rate` — JSON `{ "rate_per_sec": 1000, "burst": 2000 }`
-- `GET /stats` — counters
+- `POST /block/{ip}` вЂ” add IP to blocklist
+- `DELETE /block/{ip}` вЂ” remove IP from blocklist
+- `POST /rate` вЂ” JSON `{ "rate_per_sec": 1000, "burst": 2000 }`
+- `GET /stats` вЂ” counters
 
-## Примечания
+## Notes
 
-- `libbpf-cargo` генерирует skeleton из `ebpf/xdp_pass.bpf.c` во время `cargo build`.
-- Если загрузка XDP в native режиме не проходит, попробуйте `--mode skb`.
+- `libbpf-cargo` generates the skeleton from `ebpf/xdp_pass.bpf.c` during `cargo build`.
+- If native XDP fails, try `--mode skb`.
 
-## Дальше
+## Next
 
-План для ядра:
+Kernel plan:
 - signature detection
 - conntrack + SYN proxy
 
-План для ML:
+ML plan:
 - offline training (Python)
 - on-device inference (Rust, ONNX/TinyML)
-- поведенческая модель и bot detection
+- behavioral model and bot detection
