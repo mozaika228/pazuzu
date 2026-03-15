@@ -1,4 +1,4 @@
-// XDP program with rate limiting, blocklist, and counters.
+// XDP program with rate limiting, blocklist, counters, and rule epoch.
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -47,6 +47,14 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
+
+// Control-plane epoch for rules. Increment on any rules update.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} rules_epoch SEC(".maps");
 
 static __always_inline void bump_stat(__u32 idx) {
     __u64 *v = bpf_map_lookup_elem(&stats, &idx);

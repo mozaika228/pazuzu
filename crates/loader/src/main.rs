@@ -4,6 +4,7 @@ use clap::Parser;
 use libbpf_rs::{MapFlags, XdpFlags};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use tokio::signal;
 use tracing::{info, warn};
@@ -30,6 +31,10 @@ struct Args {
     /// Default burst (0 = use rate)
     #[arg(long, default_value_t = 0)]
     burst: u64,
+
+    /// Pin maps in bpffs (e.g. /sys/fs/bpf/pazuzu)
+    #[arg(long)]
+    pin_maps: Option<String>,
 }
 
 #[repr(C)]
@@ -37,6 +42,12 @@ struct Args {
 struct RateLimitCfg {
     rate_per_sec: u64,
     burst: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct RuleEpoch {
+    epoch: u64,
 }
 
 #[derive(Serialize)]
@@ -51,6 +62,11 @@ struct Stats {
 struct RateReq {
     rate_per_sec: u64,
     burst: u64,
+}
+
+#[derive(Serialize)]
+struct EpochResp {
+    epoch: u64,
 }
 
 include!(concat!(env!("OUT_DIR"), "/xdp_pass.skel.rs"));
@@ -94,6 +110,36 @@ fn read_stats(skel: &mut XdpPassSkel) -> Result<Stats> {
     })
 }
 
+fn read_epoch(skel: &mut XdpPassSkel) -> Result<u64> {
+    let idx: u32 = 0;
+    let v = skel
+        .maps()
+        .rules_epoch()
+        .lookup(&idx.to_ne_bytes(), MapFlags::ANY)
+        .context("lookup epoch")?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&v);
+    Ok(u64::from_ne_bytes(arr))
+}
+
+fn bump_epoch(skel: &mut XdpPassSkel) -> Result<u64> {
+    let idx: u32 = 0;
+    let current = read_epoch(skel).unwrap_or(0);
+    let next = current.saturating_add(1);
+    let val = RuleEpoch { epoch: next };
+    skel.maps()
+        .rules_epoch()
+        .update(&idx.to_ne_bytes(), &val, MapFlags::ANY)
+        .context("update epoch")?;
+    Ok(next)
+}
+
+fn pin_all_maps(skel: &mut XdpPassSkel, dir: &PathBuf) -> Result<()> {
+    std::fs::create_dir_all(dir).context("create pin dir")?;
+    skel.maps().pin(dir).context("pin maps")?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -126,6 +172,12 @@ async fn main() -> Result<()> {
         },
     )?;
 
+    if let Some(pin) = &args.pin_maps {
+        let dir = PathBuf::from(pin);
+        pin_all_maps(&mut skel, &dir)?;
+        info!("pinned maps at {}", dir.display());
+    }
+
     info!("attached xdp_pass to {} in {} mode", args.iface, args.mode);
 
     let state = Arc::new(AppState {
@@ -137,6 +189,7 @@ async fn main() -> Result<()> {
         .route("/block/:ip", post(block_ip).delete(unblock_ip))
         .route("/rate", post(set_rate))
         .route("/stats", get(get_stats))
+        .route("/rules/epoch", get(get_epoch).post(bump_rules_epoch))
         .with_state(state.clone());
 
     let api_addr = args.api.parse().context("invalid api addr")?;
@@ -177,6 +230,7 @@ async fn block_ip(
         .rules_blocklist()
         .update(&key.to_ne_bytes(), &val, MapFlags::ANY)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    bump_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -190,6 +244,7 @@ async fn unblock_ip(
         .rules_blocklist()
         .delete(&key.to_ne_bytes())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    bump_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -215,4 +270,20 @@ async fn get_stats(
     let mut skel = state.skel.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(stats))
+}
+
+async fn get_epoch(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<EpochResp>, StatusCode> {
+    let mut skel = state.skel.lock().unwrap();
+    let epoch = read_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(EpochResp { epoch }))
+}
+
+async fn bump_rules_epoch(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<EpochResp>, StatusCode> {
+    let mut skel = state.skel.lock().unwrap();
+    let epoch = bump_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(EpochResp { epoch }))
 }
