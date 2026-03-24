@@ -3,10 +3,10 @@
 High-performance WAF / IPS / Rate Limiter / Bot Protection built on eBPF/XDP with a userspace control plane.
 
 ## In This Repo
-- `ebpf/xdp_pass.bpf.c` — XDP program: IPv4 parsing, IP blocklist, CIDR blocklist (LPM trie), TCP signature detection (NULL/XMAS), rate limiting, counters, rule epoch.
-- `crates/loader` — userspace loader + HTTP API (axum) for rules and rate control.
-- `crates/ml_infer` — Rust inference stub.
-- `ml/train` — Python training skeleton.
+- `ebpf/xdp_pass.bpf.c` - XDP program: IPv4 parsing, IP blocklist, CIDR blocklist (LPM trie), TCP signature detection (NULL/XMAS), rate limiting, counters, rule epoch.
+- `crates/loader` - userspace loader + HTTP API (axum) for rules and rate control.
+- `crates/ml_infer` - Rust inference stub.
+- `ml/train` - Python training skeleton.
 
 ## Quick Start (Linux)
 
@@ -27,16 +27,18 @@ Stop: `Ctrl+C`.
 
 ## API
 
-- `POST /block/{ip}` — add IP to blocklist
-- `DELETE /block/{ip}` — remove IP from blocklist
-- `POST /block-cidr` — JSON `{ "cidr": "10.0.0.0/8" }`
-- `DELETE /block-cidr` — JSON `{ "cidr": "10.0.0.0/8" }`
-- `GET /signatures/tcp` — current TCP signature rules
-- `POST /signatures/tcp` — JSON `{ "block_null_scan": true, "block_xmas_scan": true }`
-- `POST /rate` — JSON `{ "rate_per_sec": 1000, "burst": 2000 }`
-- `GET /stats` — counters
-- `GET /rules/epoch` — current rules epoch
-- `POST /rules/epoch` — bump rules epoch
+- `POST /block/{ip}` - add IP to blocklist
+- `DELETE /block/{ip}` - remove IP from blocklist
+- `POST /block-cidr` - JSON `{ "cidr": "10.0.0.0/8" }`
+- `DELETE /block-cidr` - JSON `{ "cidr": "10.0.0.0/8" }`
+- `GET /signatures/tcp` - current TCP signature rules
+- `POST /signatures/tcp` - JSON `{ "block_null_scan": true, "block_xmas_scan": true }`
+- `GET /rules/config` - current control-plane rules snapshot
+- `POST /rules/batch` - apply batch rule changes and bump epoch once
+- `POST /rate` - JSON `{ "rate_per_sec": 1000, "burst": 2000 }`
+- `GET /stats` - counters
+- `GET /rules/epoch` - current rules epoch
+- `POST /rules/epoch` - bump rules epoch
 
 ## Notes
 
