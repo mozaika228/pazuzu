@@ -3,3 +3,8 @@
 **/*.ll
 **/*.skel.rs
 .DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+artifacts/

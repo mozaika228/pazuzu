@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install eBPF build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev pkg-config libssl-dev
+      - name: Rust fmt
+        run: cargo fmt --all -- --check
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        run: python -m pip install -r ml/train/requirements.txt
+      - name: Python syntax check
+        run: python -m py_compile ml/train/train.py ml/train/analyze.py ml/train/validate_artifacts.py
+      - name: Smoke train + validate
+        run: |
+          python ml/train/train.py --out ml/train/artifacts
+          python ml/train/validate_artifacts.py --artifacts ml/train/artifacts --min-auc 0.60 --min-f1 0.45

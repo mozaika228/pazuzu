@@ -76,3 +76,17 @@ cd pazuzu
 cargo test -p pazuzu-ml-infer
 cargo test -p pazuzu-loader
 ```
+
+## DevEx And Quality
+
+- Standardized local commands: `Makefile`
+- CI pipeline: `.github/workflows/ci.yml`
+- Contributor guide: `CONTRIBUTING.md`
+- Editor consistency: `.editorconfig`
+
+Run full local quality gate:
+
+```bash
+cd pazuzu
+make qa
+```
