@@ -50,11 +50,28 @@ struct RuleEpoch {
     epoch: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Ipv4LpmKey {
+    prefixlen: u32,
+    addr: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct TcpSignatureCfg {
+    block_null_scan: u8,
+    block_xmas_scan: u8,
+    pad: [u8; 6],
+}
+
 #[derive(Serialize)]
 struct Stats {
     pass: u64,
-    drop_block: u64,
+    drop_block_ip: u64,
+    drop_block_cidr: u64,
     drop_rate: u64,
+    drop_sig_tcp: u64,
     parse_err: u64,
 }
 
@@ -62,6 +79,23 @@ struct Stats {
 struct RateReq {
     rate_per_sec: u64,
     burst: u64,
+}
+
+#[derive(Deserialize)]
+struct CidrReq {
+    cidr: String,
+}
+
+#[derive(Deserialize)]
+struct TcpSignatureReq {
+    block_null_scan: bool,
+    block_xmas_scan: bool,
+}
+
+#[derive(Serialize)]
+struct TcpSignatureResp {
+    block_null_scan: bool,
+    block_xmas_scan: bool,
 }
 
 #[derive(Serialize)]
@@ -77,7 +111,7 @@ struct AppState {
 
 fn ipv4_to_key(ip: &str) -> Result<u32> {
     let addr: Ipv4Addr = ip.parse().context("invalid ipv4")?;
-    Ok(u32::from_be_bytes(addr.octets()))
+    Ok(u32::from_ne_bytes(addr.octets()))
 }
 
 fn set_rate_cfg(skel: &mut XdpPassSkel, cfg: RateLimitCfg) -> Result<()> {
@@ -104,9 +138,55 @@ fn read_stats(skel: &mut XdpPassSkel) -> Result<Stats> {
 
     Ok(Stats {
         pass: get_idx(0)?,
-        drop_block: get_idx(1)?,
-        drop_rate: get_idx(2)?,
-        parse_err: get_idx(3)?,
+        drop_block_ip: get_idx(1)?,
+        drop_block_cidr: get_idx(2)?,
+        drop_rate: get_idx(3)?,
+        drop_sig_tcp: get_idx(4)?,
+        parse_err: get_idx(5)?,
+    })
+}
+
+fn parse_cidr(cidr: &str) -> Result<Ipv4LpmKey> {
+    let (ip, prefix) = cidr
+        .split_once('/')
+        .context("cidr must be in a.b.c.d/prefix format")?;
+    let addr: Ipv4Addr = ip.parse().context("invalid cidr ip")?;
+    let prefixlen: u32 = prefix.parse().context("invalid cidr prefix")?;
+    if prefixlen > 32 {
+        bail!("cidr prefix must be <= 32");
+    }
+    Ok(Ipv4LpmKey {
+        prefixlen,
+        addr: u32::from_ne_bytes(addr.octets()),
+    })
+}
+
+fn set_tcp_signature_cfg(skel: &mut XdpPassSkel, req: &TcpSignatureReq) -> Result<()> {
+    let key: u32 = 0;
+    let val = TcpSignatureCfg {
+        block_null_scan: u8::from(req.block_null_scan),
+        block_xmas_scan: u8::from(req.block_xmas_scan),
+        pad: [0; 6],
+    };
+    skel.maps()
+        .rules_tcp_sig()
+        .update(&key.to_ne_bytes(), &val, MapFlags::ANY)
+        .context("update rules_tcp_sig")?;
+    Ok(())
+}
+
+fn read_tcp_signature_cfg(skel: &mut XdpPassSkel) -> Result<TcpSignatureResp> {
+    let key: u32 = 0;
+    let v = skel
+        .maps()
+        .rules_tcp_sig()
+        .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+        .context("lookup rules_tcp_sig")?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&v);
+    Ok(TcpSignatureResp {
+        block_null_scan: raw[0] != 0,
+        block_xmas_scan: raw[1] != 0,
     })
 }
 
@@ -171,6 +251,13 @@ async fn main() -> Result<()> {
             burst: args.burst,
         },
     )?;
+    set_tcp_signature_cfg(
+        &mut skel,
+        &TcpSignatureReq {
+            block_null_scan: true,
+            block_xmas_scan: true,
+        },
+    )?;
 
     if let Some(pin) = &args.pin_maps {
         let dir = PathBuf::from(pin);
@@ -187,8 +274,10 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/block/:ip", post(block_ip).delete(unblock_ip))
+        .route("/block-cidr", post(block_cidr).delete(unblock_cidr))
         .route("/rate", post(set_rate))
         .route("/stats", get(get_stats))
+        .route("/signatures/tcp", get(get_tcp_signatures).post(set_tcp_signatures))
         .route("/rules/epoch", get(get_epoch).post(bump_rules_epoch))
         .with_state(state.clone());
 
@@ -262,6 +351,56 @@ async fn set_rate(
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn block_cidr(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(req): Json<CidrReq>,
+) -> Result<StatusCode, StatusCode> {
+    let key = parse_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let val: u8 = 1;
+    let mut skel = state.skel.lock().unwrap();
+    skel.maps()
+        .rules_cidr_blocklist()
+        .update(&key, &val, MapFlags::ANY)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    bump_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unblock_cidr(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(req): Json<CidrReq>,
+) -> Result<StatusCode, StatusCode> {
+    let key = parse_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut skel = state.skel.lock().unwrap();
+    skel.maps()
+        .rules_cidr_blocklist()
+        .delete(&key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    bump_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_tcp_signatures(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(req): Json<TcpSignatureReq>,
+) -> Result<Json<TcpSignatureResp>, StatusCode> {
+    let mut skel = state.skel.lock().unwrap();
+    set_tcp_signature_cfg(&mut skel, &req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    bump_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(TcpSignatureResp {
+        block_null_scan: req.block_null_scan,
+        block_xmas_scan: req.block_xmas_scan,
+    }))
+}
+
+async fn get_tcp_signatures(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<TcpSignatureResp>, StatusCode> {
+    let mut skel = state.skel.lock().unwrap();
+    let cfg = read_tcp_signature_cfg(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(cfg))
 }
 
 async fn get_stats(

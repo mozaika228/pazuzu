@@ -6,9 +6,11 @@
 #include <bpf/bpf_helpers.h>
 
 #define STAT_PASS 0
-#define STAT_DROP_BLOCK 1
-#define STAT_DROP_RL 2
-#define STAT_PARSE_ERR 3
+#define STAT_DROP_BLOCK_IP 1
+#define STAT_DROP_BLOCK_CIDR 2
+#define STAT_DROP_RL 3
+#define STAT_DROP_SIG_TCP 4
+#define STAT_PARSE_ERR 5
 
 struct rate_limit_cfg {
     __u64 rate_per_sec;
@@ -18,6 +20,17 @@ struct rate_limit_cfg {
 struct rate_state {
     __u64 tokens;
     __u64 last_ns;
+};
+
+struct ipv4_lpm_key {
+    __u32 prefixlen;
+    __u32 addr;
+};
+
+struct tcp_signature_cfg {
+    __u8 block_null_scan;
+    __u8 block_xmas_scan;
+    __u8 _pad[6];
 };
 
 struct {
@@ -42,8 +55,23 @@ struct {
 } rules_blocklist SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __uint(max_entries, 4096);
+    __type(key, struct ipv4_lpm_key);
+    __type(value, __u8);
+} rules_cidr_blocklist SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 4);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct tcp_signature_cfg);
+} rules_tcp_sig SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 6);
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
@@ -76,6 +104,36 @@ static __always_inline int parse_ipv4(void *data, void *data_end, __u32 *saddr) 
         return -1;
     }
     *saddr = iph->saddr; // network order
+    return 0;
+}
+
+static __always_inline int tcp_signature_drop(void *data, void *data_end) {
+    struct ethhdr *eth = data;
+    struct iphdr *iph = (void *)(eth + 1);
+    struct tcphdr *tcph;
+    __u32 k = 0;
+
+    if ((void *)(iph + 1) > data_end || iph->protocol != IPPROTO_TCP) {
+        return 0;
+    }
+
+    tcph = (void *)iph + (iph->ihl * 4);
+    if ((void *)(tcph + 1) > data_end) {
+        return 0;
+    }
+
+    struct tcp_signature_cfg *cfg = bpf_map_lookup_elem(&rules_tcp_sig, &k);
+    if (!cfg) {
+        return 0;
+    }
+
+    __u8 flags = *((__u8 *)tcph + 13);
+    if (cfg->block_null_scan && flags == 0) {
+        return 1;
+    }
+    if (cfg->block_xmas_scan && flags == 0x29) {
+        return 1;
+    }
     return 0;
 }
 
@@ -132,7 +190,22 @@ int xdp_pass(struct xdp_md *ctx) {
 
     __u8 *blocked = bpf_map_lookup_elem(&rules_blocklist, &saddr);
     if (blocked && *blocked == 1) {
-        bump_stat(STAT_DROP_BLOCK);
+        bump_stat(STAT_DROP_BLOCK_IP);
+        return XDP_DROP;
+    }
+
+    struct ipv4_lpm_key lpm_key = {
+        .prefixlen = 32,
+        .addr = saddr,
+    };
+    blocked = bpf_map_lookup_elem(&rules_cidr_blocklist, &lpm_key);
+    if (blocked && *blocked == 1) {
+        bump_stat(STAT_DROP_BLOCK_CIDR);
+        return XDP_DROP;
+    }
+
+    if (tcp_signature_drop(data, data_end)) {
+        bump_stat(STAT_DROP_SIG_TCP);
         return XDP_DROP;
     }
 
