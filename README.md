@@ -35,6 +35,7 @@ Stop: `Ctrl+C`.
 - `POST /signatures/tcp` - JSON `{ "block_null_scan": true, "block_xmas_scan": true }`
 - `GET /rules/config` - current control-plane rules snapshot
 - `POST /rules/batch` - apply batch rule changes and bump epoch once
+- `GET /metrics` - Prometheus metrics for control-plane and eBPF counters
 - `POST /rate` - JSON `{ "rate_per_sec": 1000, "burst": 2000 }`
 - `GET /stats` - counters
 - `GET /rules/epoch` - current rules epoch

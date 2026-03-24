@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use axum::{extract::Path, http::StatusCode, routing::{delete, get, post}, Json, Router};
 use clap::Parser;
 use libbpf_rs::{MapFlags, XdpFlags};
+use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -127,6 +128,7 @@ include!(concat!(env!("OUT_DIR"), "/xdp_pass.skel.rs"));
 struct AppState {
     skel: Mutex<XdpPassSkel>,
     rules: Mutex<RuleStore>,
+    metrics: AppMetrics,
 }
 
 #[derive(Default)]
@@ -135,6 +137,60 @@ struct RuleStore {
     blocked_ips: HashSet<String>,
     blocked_cidrs: HashSet<String>,
     tcp_signatures: TcpSignatureReq,
+}
+
+#[derive(Clone)]
+struct AppMetrics {
+    registry: Registry,
+    metrics_scrapes_total: IntCounter,
+    rules_epoch: IntGauge,
+    blocked_ips: IntGauge,
+    blocked_cidrs: IntGauge,
+    ebpf_pass: IntGauge,
+    ebpf_drop_block_ip: IntGauge,
+    ebpf_drop_block_cidr: IntGauge,
+    ebpf_drop_rate: IntGauge,
+    ebpf_drop_sig_tcp: IntGauge,
+    ebpf_parse_err: IntGauge,
+}
+
+fn build_metrics() -> Result<AppMetrics> {
+    let registry = Registry::new();
+    let metrics_scrapes_total = IntCounter::new("pazuzu_metrics_scrapes_total", "Metrics endpoint scrapes")?;
+    let rules_epoch = IntGauge::new("pazuzu_rules_epoch", "Current rules epoch")?;
+    let blocked_ips = IntGauge::new("pazuzu_rules_blocked_ips", "Blocked IPv4 count in control plane store")?;
+    let blocked_cidrs = IntGauge::new("pazuzu_rules_blocked_cidrs", "Blocked CIDR count in control plane store")?;
+    let ebpf_pass = IntGauge::new("pazuzu_ebpf_pass_total", "eBPF pass packets")?;
+    let ebpf_drop_block_ip = IntGauge::new("pazuzu_ebpf_drop_block_ip_total", "eBPF drops by exact IPv4 blocklist")?;
+    let ebpf_drop_block_cidr = IntGauge::new("pazuzu_ebpf_drop_block_cidr_total", "eBPF drops by CIDR blocklist")?;
+    let ebpf_drop_rate = IntGauge::new("pazuzu_ebpf_drop_rate_total", "eBPF drops by rate limiter")?;
+    let ebpf_drop_sig_tcp = IntGauge::new("pazuzu_ebpf_drop_sig_tcp_total", "eBPF drops by TCP signature rules")?;
+    let ebpf_parse_err = IntGauge::new("pazuzu_ebpf_parse_err_total", "eBPF parse errors")?;
+
+    registry.register(Box::new(metrics_scrapes_total.clone()))?;
+    registry.register(Box::new(rules_epoch.clone()))?;
+    registry.register(Box::new(blocked_ips.clone()))?;
+    registry.register(Box::new(blocked_cidrs.clone()))?;
+    registry.register(Box::new(ebpf_pass.clone()))?;
+    registry.register(Box::new(ebpf_drop_block_ip.clone()))?;
+    registry.register(Box::new(ebpf_drop_block_cidr.clone()))?;
+    registry.register(Box::new(ebpf_drop_rate.clone()))?;
+    registry.register(Box::new(ebpf_drop_sig_tcp.clone()))?;
+    registry.register(Box::new(ebpf_parse_err.clone()))?;
+
+    Ok(AppMetrics {
+        registry,
+        metrics_scrapes_total,
+        rules_epoch,
+        blocked_ips,
+        blocked_cidrs,
+        ebpf_pass,
+        ebpf_drop_block_ip,
+        ebpf_drop_block_cidr,
+        ebpf_drop_rate,
+        ebpf_drop_sig_tcp,
+        ebpf_parse_err,
+    })
 }
 
 fn ipv4_to_key(ip: &str) -> Result<u32> {
@@ -314,6 +370,7 @@ async fn main() -> Result<()> {
     info!("attached xdp_pass to {} in {} mode", args.iface, args.mode);
 
     let current_epoch = read_epoch(&mut skel).unwrap_or(0);
+    let metrics = build_metrics().context("init prometheus metrics")?;
     let state = Arc::new(AppState {
         skel: Mutex::new(skel),
         rules: Mutex::new(RuleStore {
@@ -325,10 +382,12 @@ async fn main() -> Result<()> {
                 block_xmas_scan: true,
             },
         }),
+        metrics,
     });
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(get_metrics))
         .route("/block/:ip", post(block_ip).delete(unblock_ip))
         .route("/block-cidr", post(block_cidr).delete(unblock_cidr))
         .route("/rate", post(set_rate))
@@ -471,6 +530,39 @@ async fn get_tcp_signatures(
     let mut skel = state.skel.lock().unwrap();
     let cfg = read_tcp_signature_cfg(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(cfg))
+}
+
+async fn get_metrics(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<(StatusCode, [(&'static str, &'static str); 1], String), StatusCode> {
+    let mut skel = state.skel.lock().unwrap();
+    let rules = state.rules.lock().unwrap();
+    let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let epoch = read_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    state.metrics.metrics_scrapes_total.inc();
+    state.metrics.rules_epoch.set(epoch as i64);
+    state.metrics.blocked_ips.set(rules.blocked_ips.len() as i64);
+    state.metrics.blocked_cidrs.set(rules.blocked_cidrs.len() as i64);
+    state.metrics.ebpf_pass.set(stats.pass as i64);
+    state.metrics.ebpf_drop_block_ip.set(stats.drop_block_ip as i64);
+    state.metrics.ebpf_drop_block_cidr.set(stats.drop_block_cidr as i64);
+    state.metrics.ebpf_drop_rate.set(stats.drop_rate as i64);
+    state.metrics.ebpf_drop_sig_tcp.set(stats.drop_sig_tcp as i64);
+    state.metrics.ebpf_parse_err.set(stats.parse_err as i64);
+
+    let metric_families = state.metrics.registry.gather();
+    let mut output = Vec::new();
+    TextEncoder::new()
+        .encode(&metric_families, &mut output)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let body = String::from_utf8(output).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    ))
 }
 
 async fn get_stats(
