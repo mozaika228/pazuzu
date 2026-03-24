@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use axum::{extract::Path, http::StatusCode, routing::{delete, get, post}, Json, Router};
+use axum::{extract::Path, http::{HeaderMap, StatusCode}, routing::{delete, get, post}, Json, Router};
 use clap::Parser;
 use libbpf_rs::{MapFlags, XdpFlags};
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
@@ -37,6 +37,10 @@ struct Args {
     /// Pin maps in bpffs (e.g. /sys/fs/bpf/pazuzu)
     #[arg(long)]
     pin_maps: Option<String>,
+
+    /// API key for control-plane endpoints (header: X-API-Key)
+    #[arg(long)]
+    api_key: Option<String>,
 }
 
 #[repr(C)]
@@ -129,6 +133,7 @@ struct AppState {
     skel: Mutex<XdpPassSkel>,
     rules: Mutex<RuleStore>,
     metrics: AppMetrics,
+    api_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -138,6 +143,9 @@ struct RuleStore {
     blocked_cidrs: HashSet<String>,
     tcp_signatures: TcpSignatureReq,
 }
+
+const MAX_BATCH_IPS: usize = 2048;
+const MAX_BATCH_CIDRS: usize = 2048;
 
 #[derive(Clone)]
 struct AppMetrics {
@@ -316,6 +324,31 @@ fn next_epoch(skel: &mut XdpPassSkel, rules: &mut RuleStore) -> Result<u64> {
     Ok(next)
 }
 
+fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
+    let Some(expected) = &state.api_key else {
+        return Ok(());
+    };
+    let provided = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if provided == expected {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn validate_batch(req: &RulesBatchReq) -> Result<(), StatusCode> {
+    if req.add_ips.len() > MAX_BATCH_IPS || req.remove_ips.len() > MAX_BATCH_IPS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    if req.add_cidrs.len() > MAX_BATCH_CIDRS || req.remove_cidrs.len() > MAX_BATCH_CIDRS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(())
+}
+
 fn pin_all_maps(skel: &mut XdpPassSkel, dir: &PathBuf) -> Result<()> {
     std::fs::create_dir_all(dir).context("create pin dir")?;
     skel.maps().pin(dir).context("pin maps")?;
@@ -383,6 +416,7 @@ async fn main() -> Result<()> {
             },
         }),
         metrics,
+        api_key: args.api_key.clone(),
     });
 
     let app = Router::new()
@@ -426,9 +460,11 @@ async fn main() -> Result<()> {
 }
 
 async fn block_ip(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Path(ip): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    authorize(&headers, &state)?;
     let key = ipv4_to_key(&ip).map_err(|_| StatusCode::BAD_REQUEST)?;
     let val: u8 = 1;
     let mut skel = state.skel.lock().unwrap();
@@ -443,9 +479,11 @@ async fn block_ip(
 }
 
 async fn unblock_ip(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Path(ip): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    authorize(&headers, &state)?;
     let key = ipv4_to_key(&ip).map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
@@ -459,9 +497,11 @@ async fn unblock_ip(
 }
 
 async fn set_rate(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<RateReq>,
 ) -> Result<StatusCode, StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     set_rate_cfg(
         &mut skel,
@@ -475,9 +515,11 @@ async fn set_rate(
 }
 
 async fn block_cidr(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<CidrReq>,
 ) -> Result<StatusCode, StatusCode> {
+    authorize(&headers, &state)?;
     let key = parse_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let normalized = normalize_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let val: u8 = 1;
@@ -493,9 +535,11 @@ async fn block_cidr(
 }
 
 async fn unblock_cidr(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<CidrReq>,
 ) -> Result<StatusCode, StatusCode> {
+    authorize(&headers, &state)?;
     let key = parse_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let normalized = normalize_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut skel = state.skel.lock().unwrap();
@@ -510,9 +554,11 @@ async fn unblock_cidr(
 }
 
 async fn set_tcp_signatures(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<TcpSignatureReq>,
 ) -> Result<Json<TcpSignatureResp>, StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
     set_tcp_signature_cfg(&mut skel, &req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -525,16 +571,20 @@ async fn set_tcp_signatures(
 }
 
 async fn get_tcp_signatures(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<TcpSignatureResp>, StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     let cfg = read_tcp_signature_cfg(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(cfg))
 }
 
 async fn get_metrics(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<(StatusCode, [(&'static str, &'static str); 1], String), StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     let rules = state.rules.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -566,24 +616,30 @@ async fn get_metrics(
 }
 
 async fn get_stats(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<Stats>, StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(stats))
 }
 
 async fn get_epoch(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<EpochResp>, StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     let epoch = read_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(EpochResp { epoch }))
 }
 
 async fn bump_rules_epoch(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<EpochResp>, StatusCode> {
+    authorize(&headers, &state)?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
     let epoch = next_epoch(&mut skel, &mut rules).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -591,8 +647,10 @@ async fn bump_rules_epoch(
 }
 
 async fn get_rules_config(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<RulesConfigResp>, StatusCode> {
+    authorize(&headers, &state)?;
     let rules = state.rules.lock().unwrap();
     let mut blocked_ips: Vec<String> = rules.blocked_ips.iter().cloned().collect();
     let mut blocked_cidrs: Vec<String> = rules.blocked_cidrs.iter().cloned().collect();
@@ -610,9 +668,12 @@ async fn get_rules_config(
 }
 
 async fn apply_rules_batch(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<RulesBatchReq>,
 ) -> Result<Json<EpochResp>, StatusCode> {
+    authorize(&headers, &state)?;
+    validate_batch(&req)?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
 

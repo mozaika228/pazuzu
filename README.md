@@ -20,13 +20,14 @@ Build and run:
 ```bash
 cd pazuzu
 cargo build -p pazuzu-loader
-sudo ./target/debug/pazuzu-loader --iface eth0 --mode native --api 127.0.0.1:8080 --rate 1000 --burst 2000 --pin-maps /sys/fs/bpf/pazuzu
+sudo ./target/debug/pazuzu-loader --iface eth0 --mode native --api 127.0.0.1:8080 --rate 1000 --burst 2000 --pin-maps /sys/fs/bpf/pazuzu --api-key pazuzu-dev-key
 ```
 
 Stop: `Ctrl+C`.
 
 ## API
 
+- All endpoints except `/health` require header: `X-API-Key: <your-key>` when `--api-key` is set.
 - `POST /block/{ip}` - add IP to blocklist
 - `DELETE /block/{ip}` - remove IP from blocklist
 - `POST /block-cidr` - JSON `{ "cidr": "10.0.0.0/8" }`
@@ -46,6 +47,7 @@ Stop: `Ctrl+C`.
 - `libbpf-cargo` generates the skeleton from `ebpf/xdp_pass.bpf.c` during `cargo build`.
 - If native XDP fails, try `--mode skb`.
 - Use `--pin-maps /sys/fs/bpf/pazuzu` to persist maps and reload programs without losing rules.
+- Batch limits: up to `2048` IP updates and `2048` CIDR updates per `/rules/batch` call.
 
 ## Next
 
