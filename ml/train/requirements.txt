@@ -3,3 +3,5 @@ catboost
 scikit-learn
 onnx
 skl2onnx
+numpy
+pandas

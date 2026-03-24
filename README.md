@@ -5,8 +5,8 @@ High-performance WAF / IPS / Rate Limiter / Bot Protection built on eBPF/XDP wit
 ## In This Repo
 - `ebpf/xdp_pass.bpf.c` - XDP program: IPv4 parsing, IP blocklist, CIDR blocklist (LPM trie), TCP signature detection (NULL/XMAS), rate limiting, counters, rule epoch.
 - `crates/loader` - userspace loader + HTTP API (axum) for rules and rate control.
-- `crates/ml_infer` - Rust inference stub.
-- `ml/train` - Python training skeleton.
+- `crates/ml_infer` - Rust inference module with thresholding and rolling analytics.
+- `ml/train` - Python training and analytics pipeline (`train.py`, `analyze.py`).
 
 ## Quick Start (Linux)
 
@@ -56,3 +56,11 @@ ML plan:
 - offline training (Python)
 - on-device inference (Rust, ONNX/TinyML)
 - behavioral model and bot detection
+
+## ML And Analytics Quickstart
+
+```bash
+cd pazuzu/ml/train
+python train.py --out artifacts
+python analyze.py --predictions /path/to/predictions.jsonl --baseline artifacts/feature_baseline.json --out artifacts/analytics_report.json
+```
