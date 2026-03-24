@@ -34,6 +34,14 @@ python analyze.py --predictions /path/to/predictions.jsonl --baseline artifacts/
 - `latency_us` (float)
 - optional `label` (0 or 1) for precision/recall
 
+## Validation (Python)
+
+Validate training artifacts before promoting model:
+
+```bash
+python validate_artifacts.py --artifacts artifacts --min-auc 0.75 --min-f1 0.55
+```
+
 ## Inference (Rust)
 
 `crates/ml_infer` now provides:

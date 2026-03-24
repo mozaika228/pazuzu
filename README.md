@@ -65,5 +65,14 @@ ML plan:
 ```bash
 cd pazuzu/ml/train
 python train.py --out artifacts
+python validate_artifacts.py --artifacts artifacts --min-auc 0.75 --min-f1 0.55
 python analyze.py --predictions /path/to/predictions.jsonl --baseline artifacts/feature_baseline.json --out artifacts/analytics_report.json
+```
+
+## Tests And Validation
+
+```bash
+cd pazuzu
+cargo test -p pazuzu-ml-infer
+cargo test -p pazuzu-loader
 ```

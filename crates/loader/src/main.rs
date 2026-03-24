@@ -119,6 +119,7 @@ struct RulesConfigResp {
 }
 
 #[derive(Deserialize)]
+#[derive(Default)]
 struct RulesBatchReq {
     add_ips: Vec<String>,
     remove_ips: Vec<String>,
@@ -324,8 +325,8 @@ fn next_epoch(skel: &mut XdpPassSkel, rules: &mut RuleStore) -> Result<u64> {
     Ok(next)
 }
 
-fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
-    let Some(expected) = &state.api_key else {
+fn authorize(headers: &HeaderMap, expected: Option<&str>) -> Result<(), StatusCode> {
+    let Some(expected) = expected else {
         return Ok(());
     };
     let provided = headers
@@ -464,7 +465,7 @@ async fn block_ip(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Path(ip): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let key = ipv4_to_key(&ip).map_err(|_| StatusCode::BAD_REQUEST)?;
     let val: u8 = 1;
     let mut skel = state.skel.lock().unwrap();
@@ -483,7 +484,7 @@ async fn unblock_ip(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Path(ip): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let key = ipv4_to_key(&ip).map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
@@ -501,7 +502,7 @@ async fn set_rate(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<RateReq>,
 ) -> Result<StatusCode, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     set_rate_cfg(
         &mut skel,
@@ -519,7 +520,7 @@ async fn block_cidr(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<CidrReq>,
 ) -> Result<StatusCode, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let key = parse_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let normalized = normalize_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let val: u8 = 1;
@@ -539,7 +540,7 @@ async fn unblock_cidr(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<CidrReq>,
 ) -> Result<StatusCode, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let key = parse_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let normalized = normalize_cidr(&req.cidr).map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut skel = state.skel.lock().unwrap();
@@ -558,7 +559,7 @@ async fn set_tcp_signatures(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<TcpSignatureReq>,
 ) -> Result<Json<TcpSignatureResp>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
     set_tcp_signature_cfg(&mut skel, &req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -574,7 +575,7 @@ async fn get_tcp_signatures(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<TcpSignatureResp>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let cfg = read_tcp_signature_cfg(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(cfg))
@@ -584,7 +585,7 @@ async fn get_metrics(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<(StatusCode, [(&'static str, &'static str); 1], String), StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let rules = state.rules.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -619,7 +620,7 @@ async fn get_stats(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<Stats>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(stats))
@@ -629,7 +630,7 @@ async fn get_epoch(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<EpochResp>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let epoch = read_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(EpochResp { epoch }))
@@ -639,7 +640,7 @@ async fn bump_rules_epoch(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<EpochResp>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
     let epoch = next_epoch(&mut skel, &mut rules).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -650,7 +651,7 @@ async fn get_rules_config(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<RulesConfigResp>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     let rules = state.rules.lock().unwrap();
     let mut blocked_ips: Vec<String> = rules.blocked_ips.iter().cloned().collect();
     let mut blocked_cidrs: Vec<String> = rules.blocked_cidrs.iter().cloned().collect();
@@ -672,7 +673,7 @@ async fn apply_rules_batch(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(req): Json<RulesBatchReq>,
 ) -> Result<Json<EpochResp>, StatusCode> {
-    authorize(&headers, &state)?;
+    authorize(&headers, state.api_key.as_deref())?;
     validate_batch(&req)?;
     let mut skel = state.skel.lock().unwrap();
     let mut rules = state.rules.lock().unwrap();
@@ -724,4 +725,47 @@ async fn apply_rules_batch(
 
     let epoch = next_epoch(&mut skel, &mut rules).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(EpochResp { epoch }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_normalize_cidr_ok() {
+        let key = parse_cidr("10.1.2.3/24").expect("cidr should parse");
+        assert_eq!(key.prefixlen, 24);
+        assert_eq!(normalize_cidr("10.1.2.3/24").expect("cidr normalize"), "10.1.2.3/24");
+    }
+
+    #[test]
+    fn parse_cidr_rejects_bad_prefix() {
+        assert!(parse_cidr("10.1.2.3/33").is_err());
+        assert!(normalize_cidr("10.1.2.3/999").is_err());
+    }
+
+    #[test]
+    fn validate_batch_limits() {
+        let ok = RulesBatchReq {
+            add_ips: vec!["1.1.1.1".to_string(); MAX_BATCH_IPS],
+            ..Default::default()
+        };
+        assert!(validate_batch(&ok).is_ok());
+
+        let too_many = RulesBatchReq {
+            add_ips: vec!["1.1.1.1".to_string(); MAX_BATCH_IPS + 1],
+            ..Default::default()
+        };
+        assert_eq!(validate_batch(&too_many).unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn authorize_works_for_missing_and_present_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "secret".parse().expect("header value"));
+
+        assert!(authorize(&headers, None).is_ok());
+        assert!(authorize(&headers, Some("secret")).is_ok());
+        assert_eq!(authorize(&headers, Some("wrong")).unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
 }
