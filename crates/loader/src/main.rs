@@ -71,6 +71,16 @@ struct TcpSignatureCfg {
     pad: [u8; 6],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConntrackCfg {
+    enable_syn_proxy: u8,
+    pad0: [u8; 3],
+    max_half_open: u32,
+    syn_timeout_ns: u64,
+    est_timeout_ns: u64,
+}
+
 #[derive(Serialize)]
 struct Stats {
     pass: u64,
@@ -79,6 +89,10 @@ struct Stats {
     drop_rate: u64,
     drop_sig_tcp: u64,
     parse_err: u64,
+    syn_seen: u64,
+    syn_acked: u64,
+    drop_syn_proxy: u64,
+    ct_established: u64,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +119,23 @@ struct TcpSignatureResp {
     block_xmas_scan: bool,
 }
 
+#[derive(Deserialize, Clone, Default)]
+struct ConntrackReq {
+    enable_syn_proxy: bool,
+    max_half_open: u32,
+    syn_timeout_ms: u64,
+    est_timeout_ms: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct ConntrackResp {
+    enable_syn_proxy: bool,
+    max_half_open: u32,
+    syn_timeout_ms: u64,
+    est_timeout_ms: u64,
+    half_open_now: u64,
+}
+
 #[derive(Serialize)]
 struct EpochResp {
     epoch: u64,
@@ -116,6 +147,7 @@ struct RulesConfigResp {
     blocked_ips: Vec<String>,
     blocked_cidrs: Vec<String>,
     tcp_signatures: TcpSignatureResp,
+    conntrack: ConntrackResp,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +158,7 @@ struct RulesBatchReq {
     add_cidrs: Vec<String>,
     remove_cidrs: Vec<String>,
     tcp_signatures: Option<TcpSignatureReq>,
+    conntrack: Option<ConntrackReq>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/xdp_pass.skel.rs"));
@@ -143,6 +176,7 @@ struct RuleStore {
     blocked_ips: HashSet<String>,
     blocked_cidrs: HashSet<String>,
     tcp_signatures: TcpSignatureReq,
+    conntrack: ConntrackReq,
 }
 
 const MAX_BATCH_IPS: usize = 2048;
@@ -161,6 +195,11 @@ struct AppMetrics {
     ebpf_drop_rate: IntGauge,
     ebpf_drop_sig_tcp: IntGauge,
     ebpf_parse_err: IntGauge,
+    ebpf_syn_seen: IntGauge,
+    ebpf_syn_acked: IntGauge,
+    ebpf_drop_syn_proxy: IntGauge,
+    ebpf_ct_established: IntGauge,
+    conntrack_half_open_now: IntGauge,
 }
 
 fn build_metrics() -> Result<AppMetrics> {
@@ -175,6 +214,11 @@ fn build_metrics() -> Result<AppMetrics> {
     let ebpf_drop_rate = IntGauge::new("pazuzu_ebpf_drop_rate_total", "eBPF drops by rate limiter")?;
     let ebpf_drop_sig_tcp = IntGauge::new("pazuzu_ebpf_drop_sig_tcp_total", "eBPF drops by TCP signature rules")?;
     let ebpf_parse_err = IntGauge::new("pazuzu_ebpf_parse_err_total", "eBPF parse errors")?;
+    let ebpf_syn_seen = IntGauge::new("pazuzu_ebpf_syn_seen_total", "SYN packets observed by conntrack gate")?;
+    let ebpf_syn_acked = IntGauge::new("pazuzu_ebpf_syn_acked_total", "SYN handshakes validated by conntrack gate")?;
+    let ebpf_drop_syn_proxy = IntGauge::new("pazuzu_ebpf_drop_syn_proxy_total", "Drops by SYN proxy / conntrack guard")?;
+    let ebpf_ct_established = IntGauge::new("pazuzu_ebpf_ct_established_total", "Connections moved to established state")?;
+    let conntrack_half_open_now = IntGauge::new("pazuzu_conntrack_half_open_now", "Current approximate half-open conntrack entries")?;
 
     registry.register(Box::new(metrics_scrapes_total.clone()))?;
     registry.register(Box::new(rules_epoch.clone()))?;
@@ -186,6 +230,11 @@ fn build_metrics() -> Result<AppMetrics> {
     registry.register(Box::new(ebpf_drop_rate.clone()))?;
     registry.register(Box::new(ebpf_drop_sig_tcp.clone()))?;
     registry.register(Box::new(ebpf_parse_err.clone()))?;
+    registry.register(Box::new(ebpf_syn_seen.clone()))?;
+    registry.register(Box::new(ebpf_syn_acked.clone()))?;
+    registry.register(Box::new(ebpf_drop_syn_proxy.clone()))?;
+    registry.register(Box::new(ebpf_ct_established.clone()))?;
+    registry.register(Box::new(conntrack_half_open_now.clone()))?;
 
     Ok(AppMetrics {
         registry,
@@ -199,6 +248,11 @@ fn build_metrics() -> Result<AppMetrics> {
         ebpf_drop_rate,
         ebpf_drop_sig_tcp,
         ebpf_parse_err,
+        ebpf_syn_seen,
+        ebpf_syn_acked,
+        ebpf_drop_syn_proxy,
+        ebpf_ct_established,
+        conntrack_half_open_now,
     })
 }
 
@@ -236,6 +290,10 @@ fn read_stats(skel: &mut XdpPassSkel) -> Result<Stats> {
         drop_rate: get_idx(3)?,
         drop_sig_tcp: get_idx(4)?,
         parse_err: get_idx(5)?,
+        syn_seen: get_idx(6)?,
+        syn_acked: get_idx(7)?,
+        drop_syn_proxy: get_idx(8)?,
+        ct_established: get_idx(9)?,
     })
 }
 
@@ -293,6 +351,56 @@ fn read_tcp_signature_cfg(skel: &mut XdpPassSkel) -> Result<TcpSignatureResp> {
         block_null_scan: raw[0] != 0,
         block_xmas_scan: raw[1] != 0,
     })
+}
+
+fn set_conntrack_cfg(skel: &mut XdpPassSkel, req: &ConntrackReq) -> Result<()> {
+    let key: u32 = 0;
+    let val = ConntrackCfg {
+        enable_syn_proxy: u8::from(req.enable_syn_proxy),
+        pad0: [0; 3],
+        max_half_open: req.max_half_open,
+        syn_timeout_ns: req.syn_timeout_ms.saturating_mul(1_000_000),
+        est_timeout_ns: req.est_timeout_ms.saturating_mul(1_000_000),
+    };
+    skel.maps()
+        .conntrack_cfg_map()
+        .update(&key.to_ne_bytes(), &val, MapFlags::ANY)
+        .context("update conntrack cfg")?;
+    Ok(())
+}
+
+fn read_conntrack_cfg(skel: &mut XdpPassSkel) -> Result<ConntrackReq> {
+    let key: u32 = 0;
+    let v = skel
+        .maps()
+        .conntrack_cfg_map()
+        .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+        .context("lookup conntrack cfg")?;
+    if v.len() < 24 {
+        bail!("conntrack cfg payload too short");
+    }
+    let enable_syn_proxy = v[0] != 0;
+    let max_half_open = u32::from_ne_bytes([v[4], v[5], v[6], v[7]]);
+    let syn_timeout_ns = u64::from_ne_bytes([v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]]);
+    let est_timeout_ns = u64::from_ne_bytes([v[16], v[17], v[18], v[19], v[20], v[21], v[22], v[23]]);
+    Ok(ConntrackReq {
+        enable_syn_proxy,
+        max_half_open,
+        syn_timeout_ms: syn_timeout_ns / 1_000_000,
+        est_timeout_ms: est_timeout_ns / 1_000_000,
+    })
+}
+
+fn read_half_open_now(skel: &mut XdpPassSkel) -> Result<u64> {
+    let key: u32 = 0;
+    let v = skel
+        .maps()
+        .conntrack_half_open()
+        .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+        .context("lookup conntrack_half_open")?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&v);
+    Ok(u64::from_ne_bytes(arr))
 }
 
 fn read_epoch(skel: &mut XdpPassSkel) -> Result<u64> {
@@ -394,6 +502,13 @@ async fn main() -> Result<()> {
             block_xmas_scan: true,
         },
     )?;
+    let default_conntrack = ConntrackReq {
+        enable_syn_proxy: true,
+        max_half_open: 32768,
+        syn_timeout_ms: 30000,
+        est_timeout_ms: 300000,
+    };
+    set_conntrack_cfg(&mut skel, &default_conntrack)?;
 
     if let Some(pin) = &args.pin_maps {
         let dir = PathBuf::from(pin);
@@ -415,6 +530,7 @@ async fn main() -> Result<()> {
                 block_null_scan: true,
                 block_xmas_scan: true,
             },
+            conntrack: default_conntrack.clone(),
         }),
         metrics,
         api_key: args.api_key.clone(),
@@ -428,6 +544,7 @@ async fn main() -> Result<()> {
         .route("/rate", post(set_rate))
         .route("/stats", get(get_stats))
         .route("/signatures/tcp", get(get_tcp_signatures).post(set_tcp_signatures))
+        .route("/conntrack", get(get_conntrack).post(set_conntrack))
         .route("/rules/config", get(get_rules_config))
         .route("/rules/batch", post(apply_rules_batch))
         .route("/rules/epoch", get(get_epoch).post(bump_rules_epoch))
@@ -581,6 +698,48 @@ async fn get_tcp_signatures(
     Ok(Json(cfg))
 }
 
+async fn set_conntrack(
+    headers: HeaderMap,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(req): Json<ConntrackReq>,
+) -> Result<Json<ConntrackResp>, StatusCode> {
+    authorize(&headers, state.api_key.as_deref())?;
+    if req.syn_timeout_ms == 0 || req.est_timeout_ms == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut skel = state.skel.lock().unwrap();
+    let mut rules = state.rules.lock().unwrap();
+    set_conntrack_cfg(&mut skel, &req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    rules.conntrack = req.clone();
+    next_epoch(&mut skel, &mut rules).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let half_open_now = read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ConntrackResp {
+        enable_syn_proxy: req.enable_syn_proxy,
+        max_half_open: req.max_half_open,
+        syn_timeout_ms: req.syn_timeout_ms,
+        est_timeout_ms: req.est_timeout_ms,
+        half_open_now,
+    }))
+}
+
+async fn get_conntrack(
+    headers: HeaderMap,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<ConntrackResp>, StatusCode> {
+    authorize(&headers, state.api_key.as_deref())?;
+    let mut skel = state.skel.lock().unwrap();
+    let cfg = read_conntrack_cfg(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let half_open_now = read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ConntrackResp {
+        enable_syn_proxy: cfg.enable_syn_proxy,
+        max_half_open: cfg.max_half_open,
+        syn_timeout_ms: cfg.syn_timeout_ms,
+        est_timeout_ms: cfg.est_timeout_ms,
+        half_open_now,
+    }))
+}
+
 async fn get_metrics(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -590,6 +749,7 @@ async fn get_metrics(
     let rules = state.rules.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let epoch = read_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let half_open_now = read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     state.metrics.metrics_scrapes_total.inc();
     state.metrics.rules_epoch.set(epoch as i64);
@@ -601,6 +761,11 @@ async fn get_metrics(
     state.metrics.ebpf_drop_rate.set(stats.drop_rate as i64);
     state.metrics.ebpf_drop_sig_tcp.set(stats.drop_sig_tcp as i64);
     state.metrics.ebpf_parse_err.set(stats.parse_err as i64);
+    state.metrics.ebpf_syn_seen.set(stats.syn_seen as i64);
+    state.metrics.ebpf_syn_acked.set(stats.syn_acked as i64);
+    state.metrics.ebpf_drop_syn_proxy.set(stats.drop_syn_proxy as i64);
+    state.metrics.ebpf_ct_established.set(stats.ct_established as i64);
+    state.metrics.conntrack_half_open_now.set(half_open_now as i64);
 
     let metric_families = state.metrics.registry.gather();
     let mut output = Vec::new();
@@ -652,6 +817,10 @@ async fn get_rules_config(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<RulesConfigResp>, StatusCode> {
     authorize(&headers, state.api_key.as_deref())?;
+    let half_open_now = {
+        let mut skel = state.skel.lock().unwrap();
+        read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
     let rules = state.rules.lock().unwrap();
     let mut blocked_ips: Vec<String> = rules.blocked_ips.iter().cloned().collect();
     let mut blocked_cidrs: Vec<String> = rules.blocked_cidrs.iter().cloned().collect();
@@ -664,6 +833,13 @@ async fn get_rules_config(
         tcp_signatures: TcpSignatureResp {
             block_null_scan: rules.tcp_signatures.block_null_scan,
             block_xmas_scan: rules.tcp_signatures.block_xmas_scan,
+        },
+        conntrack: ConntrackResp {
+            enable_syn_proxy: rules.conntrack.enable_syn_proxy,
+            max_half_open: rules.conntrack.max_half_open,
+            syn_timeout_ms: rules.conntrack.syn_timeout_ms,
+            est_timeout_ms: rules.conntrack.est_timeout_ms,
+            half_open_now,
         },
     }))
 }
@@ -721,6 +897,13 @@ async fn apply_rules_batch(
     if let Some(tcp) = &req.tcp_signatures {
         set_tcp_signature_cfg(&mut skel, tcp).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         rules.tcp_signatures = tcp.clone();
+    }
+    if let Some(conntrack) = &req.conntrack {
+        if conntrack.syn_timeout_ms == 0 || conntrack.est_timeout_ms == 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        set_conntrack_cfg(&mut skel, conntrack).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        rules.conntrack = conntrack.clone();
     }
 
     let epoch = next_epoch(&mut skel, &mut rules).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

@@ -34,8 +34,10 @@ Stop: `Ctrl+C`.
 - `DELETE /block-cidr` - JSON `{ "cidr": "10.0.0.0/8" }`
 - `GET /signatures/tcp` - current TCP signature rules
 - `POST /signatures/tcp` - JSON `{ "block_null_scan": true, "block_xmas_scan": true }`
+- `GET /conntrack` - current conntrack/SYN-proxy config and half-open count
+- `POST /conntrack` - JSON `{ "enable_syn_proxy": true, "max_half_open": 32768, "syn_timeout_ms": 30000, "est_timeout_ms": 300000 }`
 - `GET /rules/config` - current control-plane rules snapshot
-- `POST /rules/batch` - apply batch rule changes and bump epoch once
+- `POST /rules/batch` - apply batch rule changes (including optional `conntrack`) and bump epoch once
 - `GET /metrics` - Prometheus metrics for control-plane and eBPF counters
 - `POST /rate` - JSON `{ "rate_per_sec": 1000, "burst": 2000 }`
 - `GET /stats` - counters
@@ -48,6 +50,7 @@ Stop: `Ctrl+C`.
 - If native XDP fails, try `--mode skb`.
 - Use `--pin-maps /sys/fs/bpf/pazuzu` to persist maps and reload programs without losing rules.
 - Batch limits: up to `2048` IP updates and `2048` CIDR updates per `/rules/batch` call.
+- Data-plane counters include `syn_seen`, `syn_acked`, `drop_syn_proxy`, `ct_established`.
 
 ## Next
 
