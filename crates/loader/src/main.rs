@@ -1,5 +1,10 @@
 use anyhow::{bail, Context, Result};
-use axum::{extract::Path, http::{HeaderMap, StatusCode}, routing::{delete, get, post}, Json, Router};
+use axum::{
+    extract::Path,
+    http::{HeaderMap, StatusCode},
+    routing::{delete, get, post},
+    Json, Router,
+};
 use clap::Parser;
 use libbpf_rs::{MapFlags, XdpFlags};
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
@@ -7,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tokio::signal;
 use tracing::{info, warn};
 
@@ -106,8 +114,7 @@ struct CidrReq {
     cidr: String,
 }
 
-#[derive(Deserialize)]
-#[derive(Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 struct TcpSignatureReq {
     block_null_scan: bool,
     block_xmas_scan: bool,
@@ -150,8 +157,7 @@ struct RulesConfigResp {
     conntrack: ConntrackResp,
 }
 
-#[derive(Deserialize)]
-#[derive(Default)]
+#[derive(Deserialize, Default)]
 struct RulesBatchReq {
     add_ips: Vec<String>,
     remove_ips: Vec<String>,
@@ -204,21 +210,53 @@ struct AppMetrics {
 
 fn build_metrics() -> Result<AppMetrics> {
     let registry = Registry::new();
-    let metrics_scrapes_total = IntCounter::new("pazuzu_metrics_scrapes_total", "Metrics endpoint scrapes")?;
+    let metrics_scrapes_total =
+        IntCounter::new("pazuzu_metrics_scrapes_total", "Metrics endpoint scrapes")?;
     let rules_epoch = IntGauge::new("pazuzu_rules_epoch", "Current rules epoch")?;
-    let blocked_ips = IntGauge::new("pazuzu_rules_blocked_ips", "Blocked IPv4 count in control plane store")?;
-    let blocked_cidrs = IntGauge::new("pazuzu_rules_blocked_cidrs", "Blocked CIDR count in control plane store")?;
+    let blocked_ips = IntGauge::new(
+        "pazuzu_rules_blocked_ips",
+        "Blocked IPv4 count in control plane store",
+    )?;
+    let blocked_cidrs = IntGauge::new(
+        "pazuzu_rules_blocked_cidrs",
+        "Blocked CIDR count in control plane store",
+    )?;
     let ebpf_pass = IntGauge::new("pazuzu_ebpf_pass_total", "eBPF pass packets")?;
-    let ebpf_drop_block_ip = IntGauge::new("pazuzu_ebpf_drop_block_ip_total", "eBPF drops by exact IPv4 blocklist")?;
-    let ebpf_drop_block_cidr = IntGauge::new("pazuzu_ebpf_drop_block_cidr_total", "eBPF drops by CIDR blocklist")?;
-    let ebpf_drop_rate = IntGauge::new("pazuzu_ebpf_drop_rate_total", "eBPF drops by rate limiter")?;
-    let ebpf_drop_sig_tcp = IntGauge::new("pazuzu_ebpf_drop_sig_tcp_total", "eBPF drops by TCP signature rules")?;
+    let ebpf_drop_block_ip = IntGauge::new(
+        "pazuzu_ebpf_drop_block_ip_total",
+        "eBPF drops by exact IPv4 blocklist",
+    )?;
+    let ebpf_drop_block_cidr = IntGauge::new(
+        "pazuzu_ebpf_drop_block_cidr_total",
+        "eBPF drops by CIDR blocklist",
+    )?;
+    let ebpf_drop_rate =
+        IntGauge::new("pazuzu_ebpf_drop_rate_total", "eBPF drops by rate limiter")?;
+    let ebpf_drop_sig_tcp = IntGauge::new(
+        "pazuzu_ebpf_drop_sig_tcp_total",
+        "eBPF drops by TCP signature rules",
+    )?;
     let ebpf_parse_err = IntGauge::new("pazuzu_ebpf_parse_err_total", "eBPF parse errors")?;
-    let ebpf_syn_seen = IntGauge::new("pazuzu_ebpf_syn_seen_total", "SYN packets observed by conntrack gate")?;
-    let ebpf_syn_acked = IntGauge::new("pazuzu_ebpf_syn_acked_total", "SYN handshakes validated by conntrack gate")?;
-    let ebpf_drop_syn_proxy = IntGauge::new("pazuzu_ebpf_drop_syn_proxy_total", "Drops by SYN proxy / conntrack guard")?;
-    let ebpf_ct_established = IntGauge::new("pazuzu_ebpf_ct_established_total", "Connections moved to established state")?;
-    let conntrack_half_open_now = IntGauge::new("pazuzu_conntrack_half_open_now", "Current approximate half-open conntrack entries")?;
+    let ebpf_syn_seen = IntGauge::new(
+        "pazuzu_ebpf_syn_seen_total",
+        "SYN packets observed by conntrack gate",
+    )?;
+    let ebpf_syn_acked = IntGauge::new(
+        "pazuzu_ebpf_syn_acked_total",
+        "SYN handshakes validated by conntrack gate",
+    )?;
+    let ebpf_drop_syn_proxy = IntGauge::new(
+        "pazuzu_ebpf_drop_syn_proxy_total",
+        "Drops by SYN proxy / conntrack guard",
+    )?;
+    let ebpf_ct_established = IntGauge::new(
+        "pazuzu_ebpf_ct_established_total",
+        "Connections moved to established state",
+    )?;
+    let conntrack_half_open_now = IntGauge::new(
+        "pazuzu_conntrack_half_open_now",
+        "Current approximate half-open conntrack entries",
+    )?;
 
     registry.register(Box::new(metrics_scrapes_total.clone()))?;
     registry.register(Box::new(rules_epoch.clone()))?;
@@ -382,7 +420,8 @@ fn read_conntrack_cfg(skel: &mut XdpPassSkel) -> Result<ConntrackReq> {
     let enable_syn_proxy = v[0] != 0;
     let max_half_open = u32::from_ne_bytes([v[4], v[5], v[6], v[7]]);
     let syn_timeout_ns = u64::from_ne_bytes([v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]]);
-    let est_timeout_ns = u64::from_ne_bytes([v[16], v[17], v[18], v[19], v[20], v[21], v[22], v[23]]);
+    let est_timeout_ns =
+        u64::from_ne_bytes([v[16], v[17], v[18], v[19], v[20], v[21], v[22], v[23]]);
     Ok(ConntrackReq {
         enable_syn_proxy,
         max_half_open,
@@ -466,9 +505,7 @@ fn pin_all_maps(skel: &mut XdpPassSkel, dir: &PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
 
@@ -543,7 +580,10 @@ async fn main() -> Result<()> {
         .route("/block-cidr", post(block_cidr).delete(unblock_cidr))
         .route("/rate", post(set_rate))
         .route("/stats", get(get_stats))
-        .route("/signatures/tcp", get(get_tcp_signatures).post(set_tcp_signatures))
+        .route(
+            "/signatures/tcp",
+            get(get_tcp_signatures).post(set_tcp_signatures),
+        )
         .route("/conntrack", get(get_conntrack).post(set_conntrack))
         .route("/rules/config", get(get_rules_config))
         .route("/rules/batch", post(apply_rules_batch))
@@ -713,7 +753,8 @@ async fn set_conntrack(
     set_conntrack_cfg(&mut skel, &req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     rules.conntrack = req.clone();
     next_epoch(&mut skel, &mut rules).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let half_open_now = read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let half_open_now =
+        read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ConntrackResp {
         enable_syn_proxy: req.enable_syn_proxy,
         max_half_open: req.max_half_open,
@@ -730,7 +771,8 @@ async fn get_conntrack(
     authorize(&headers, state.api_key.as_deref())?;
     let mut skel = state.skel.lock().unwrap();
     let cfg = read_conntrack_cfg(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let half_open_now = read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let half_open_now =
+        read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ConntrackResp {
         enable_syn_proxy: cfg.enable_syn_proxy,
         max_half_open: cfg.max_half_open,
@@ -749,23 +791,48 @@ async fn get_metrics(
     let rules = state.rules.lock().unwrap();
     let stats = read_stats(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let epoch = read_epoch(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let half_open_now = read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let half_open_now =
+        read_half_open_now(&mut skel).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     state.metrics.metrics_scrapes_total.inc();
     state.metrics.rules_epoch.set(epoch as i64);
-    state.metrics.blocked_ips.set(rules.blocked_ips.len() as i64);
-    state.metrics.blocked_cidrs.set(rules.blocked_cidrs.len() as i64);
+    state
+        .metrics
+        .blocked_ips
+        .set(rules.blocked_ips.len() as i64);
+    state
+        .metrics
+        .blocked_cidrs
+        .set(rules.blocked_cidrs.len() as i64);
     state.metrics.ebpf_pass.set(stats.pass as i64);
-    state.metrics.ebpf_drop_block_ip.set(stats.drop_block_ip as i64);
-    state.metrics.ebpf_drop_block_cidr.set(stats.drop_block_cidr as i64);
+    state
+        .metrics
+        .ebpf_drop_block_ip
+        .set(stats.drop_block_ip as i64);
+    state
+        .metrics
+        .ebpf_drop_block_cidr
+        .set(stats.drop_block_cidr as i64);
     state.metrics.ebpf_drop_rate.set(stats.drop_rate as i64);
-    state.metrics.ebpf_drop_sig_tcp.set(stats.drop_sig_tcp as i64);
+    state
+        .metrics
+        .ebpf_drop_sig_tcp
+        .set(stats.drop_sig_tcp as i64);
     state.metrics.ebpf_parse_err.set(stats.parse_err as i64);
     state.metrics.ebpf_syn_seen.set(stats.syn_seen as i64);
     state.metrics.ebpf_syn_acked.set(stats.syn_acked as i64);
-    state.metrics.ebpf_drop_syn_proxy.set(stats.drop_syn_proxy as i64);
-    state.metrics.ebpf_ct_established.set(stats.ct_established as i64);
-    state.metrics.conntrack_half_open_now.set(half_open_now as i64);
+    state
+        .metrics
+        .ebpf_drop_syn_proxy
+        .set(stats.drop_syn_proxy as i64);
+    state
+        .metrics
+        .ebpf_ct_established
+        .set(stats.ct_established as i64);
+    state
+        .metrics
+        .conntrack_half_open_now
+        .set(half_open_now as i64);
 
     let metric_families = state.metrics.registry.gather();
     let mut output = Vec::new();
@@ -918,7 +985,10 @@ mod tests {
     fn parse_and_normalize_cidr_ok() {
         let key = parse_cidr("10.1.2.3/24").expect("cidr should parse");
         assert_eq!(key.prefixlen, 24);
-        assert_eq!(normalize_cidr("10.1.2.3/24").expect("cidr normalize"), "10.1.2.3/24");
+        assert_eq!(
+            normalize_cidr("10.1.2.3/24").expect("cidr normalize"),
+            "10.1.2.3/24"
+        );
     }
 
     #[test]
@@ -939,7 +1009,10 @@ mod tests {
             add_ips: vec!["1.1.1.1".to_string(); MAX_BATCH_IPS + 1],
             ..Default::default()
         };
-        assert_eq!(validate_batch(&too_many).unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            validate_batch(&too_many).unwrap_err(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[test]
@@ -949,6 +1022,9 @@ mod tests {
 
         assert!(authorize(&headers, None).is_ok());
         assert!(authorize(&headers, Some("secret")).is_ok());
-        assert_eq!(authorize(&headers, Some("wrong")).unwrap_err(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            authorize(&headers, Some("wrong")).unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

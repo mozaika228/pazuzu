@@ -43,7 +43,9 @@ impl Model {
 
     pub fn predict(&self, f: FeatureVector) -> InferenceResult {
         // Heuristic scoring until ONNX runtime is wired in.
-        let z = 0.012 * f.pkt_rate + 0.035 * f.syn_rate + 0.9 * f.ua_entropy + 0.08 * f.req_burst - 3.2;
+        let z =
+            0.012 * f.pkt_rate + 0.035 * f.syn_rate + 0.9 * f.ua_entropy + 0.08 * f.req_burst
+                - 3.2;
         let score = 1.0 / (1.0 + (-z).exp());
         InferenceResult {
             risk_score: score,
